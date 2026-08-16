@@ -53,6 +53,24 @@ function ConvertTo-PathHash {
     }
 }
 
+function Get-FolderFingerprint {
+    param([string]$Path)
+
+    $root = $Path.TrimEnd('\')
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $manifest = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $rel = $_.FullName.Substring($root.Length).TrimStart('\')
+            "$rel|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)"
+        } | Sort-Object
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($manifest -join "`n"))
+        return ([BitConverter]::ToString($md5.ComputeHash($bytes))).Replace('-', '').ToLower()
+    }
+    finally {
+        $md5.Dispose()
+    }
+}
+
 function Format-FileSize {
     param([long]$Bytes)
     if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
@@ -115,8 +133,21 @@ function Protect-FileWithAes {
 }
 
 $PathHash = ConvertTo-PathHash -Path $FilePath
-$Md5      = (Get-FileHash -LiteralPath $FilePath -Algorithm MD5).Hash.ToLower()
-$FileSize = (Get-Item -LiteralPath $FilePath).Length
+$Item     = Get-Item -LiteralPath $FilePath
+$IsFolder = $Item.PSIsContainer
+$FileSize = $Item.Length
+
+if ($IsFolder) {
+    $Md5 = Get-FolderFingerprint -Path $FilePath
+}
+else {
+    $Md5 = (Get-FileHash -LiteralPath $FilePath -Algorithm MD5).Hash.ToLower()
+}
+
+if ($IsFolder -and -not $Encryption) {
+    Write-Host "資料夾上傳需要先加密壓縮：請改用 -Encryption（或 Upload-To-WebDAV-Enc.bat）" -ForegroundColor Red
+    exit 1
+}
 
 $records = @{}
 if (Test-Path -LiteralPath $RecordFile) {
