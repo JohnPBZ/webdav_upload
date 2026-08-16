@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "envops": {
+      "source": "reorx/envops",
+      "sourceType": "github",
+      "skillPath": "skills/envops/SKILL.md",
+      "computedHash": "d908da8879343e44dfbacd2d11718d0bff098ef88c349928ca3539e418841943"
+    }
+  }
+}
