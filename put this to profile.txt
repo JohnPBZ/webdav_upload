@@ -1,0 +1,20 @@
+function global:up {
+    # 如果還沒載入過真正的實作，就載入
+    if (-not (Get-Command -Name up -CommandType Function -ErrorAction SilentlyContinue | 
+              Where-Object { $_.ScriptBlock.File -like '*func.ps1' })) {
+        
+        # 先移除目前的包裝函式，避免後面被覆蓋時出問題
+        Remove-Item -Path Function:\global:up -ErrorAction SilentlyContinue
+        
+        # 載入真正的實作（請確保 func.ps1 裡面用 function global:up）
+        . "D:\dev\private_upload\func.ps1"
+    }
+
+    # 現在呼叫的一定是真正的 up
+    up @args
+}
+
+以下用記事本打開 pwsh 配置檔案的命令
+notepad $PROFILE
+如果檔案不存在
+if (!(Test-Path $PROFILE)) { New-Item -Type File -Force $PROFILE }
