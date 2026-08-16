@@ -1,3 +1,6 @@
+首先替換D:\dev\private_upload至真實路徑
+func.ps1 裡面的 D:\dev\private_upload 要改成真實路徑
+
 function global:up {
     # 如果還沒載入過真正的實作，就載入
     if (-not (Get-Command -Name up -CommandType Function -ErrorAction SilentlyContinue | 
