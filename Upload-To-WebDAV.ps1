@@ -31,6 +31,75 @@ Write-Host "準備上傳檔案：$FileName" -ForegroundColor Cyan
 Write-Host "完整路徑：$FilePath" -ForegroundColor Gray
 Write-Host ""
 
+# -------------------------------------------------
+# 上傳記錄（本機路徑以 SHA256 雜湊儲存，避免記事本直接看出路徑）
+# -------------------------------------------------
+$RecordFile = Join-Path $ScriptDir "upload-record.txt"
+
+function ConvertTo-PathHash {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Path)
+        $hashBytes = $sha.ComputeHash($bytes)
+        return ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLower()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Format-FileSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
+    return "$Bytes bytes"
+}
+
+$PathHash = ConvertTo-PathHash -Path $FilePath
+$Md5      = (Get-FileHash -LiteralPath $FilePath -Algorithm MD5).Hash.ToLower()
+$FileSize = (Get-Item -LiteralPath $FilePath).Length
+
+$records = @{}
+if (Test-Path -LiteralPath $RecordFile) {
+    foreach ($line in (Get-Content -LiteralPath $RecordFile -Encoding UTF8)) {
+        $line = $line.Trim()
+        if ($line -eq '') { continue }
+        $fields = $line -split ';'
+        if ($fields.Count -ge 4) {
+            $records[$fields[0]] = @($fields[1], $fields[2], $fields[3])
+        }
+    }
+}
+
+$existing = $null
+if ($records.ContainsKey($PathHash)) {
+    $existing = $records[$PathHash]
+}
+else {
+    foreach ($key in $records.Keys) {
+        if ($records[$key][0] -ieq $Md5) {
+            $existing = $records[$key]
+            break
+        }
+    }
+}
+
+if ($existing) {
+    Write-Host "此檔案先前已上傳過：" -ForegroundColor Yellow
+    Write-Host "  上次上傳日期：$($existing[2])" -ForegroundColor Yellow
+    Write-Host "  MD5：$($existing[0])" -ForegroundColor Yellow
+    Write-Host "  檔案大小：$(Format-FileSize -Bytes $existing[1])" -ForegroundColor Yellow
+    Write-Host ""
+    $answer = Read-Host "是否覆蓋上傳？(Y/N，直接按 Enter 預設為 Y)"
+    if ($answer -ne '' -and $answer -notmatch '^[Yy]') {
+        Write-Host "已取消上傳。" -ForegroundColor Gray
+        exit 0
+    }
+    Write-Host ""
+}
+
 # 讀取 .env
 if (-not (Test-Path $EnvFile)) {
     Write-Host "找不到 .env 檔案：$EnvFile" -ForegroundColor Red
@@ -173,6 +242,26 @@ $curlArgs = @(
 if ($LASTEXITCODE -eq 0) {
     Write-Host ""
     Write-Host "上傳成功！" -ForegroundColor Green
+
+    # 更新上傳記錄（移除舊的相同路徑雜湊或相同 MD5 記錄，再寫入新的一筆）
+    $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $newLine = "$PathHash;$Md5;$FileSize;$now"
+
+    $oldLines = @()
+    if (Test-Path -LiteralPath $RecordFile) {
+        foreach ($line in (Get-Content -LiteralPath $RecordFile -Encoding UTF8)) {
+            $line = $line.Trim()
+            if ($line -eq '') { continue }
+            $fields = $line -split ';'
+            if ($fields.Count -ge 4 -and $fields[0] -ne $PathHash -and $fields[1] -ine $Md5) {
+                $oldLines += $line
+            }
+        }
+    }
+    $oldLines += $newLine
+    $oldLines | Set-Content -LiteralPath $RecordFile -Encoding UTF8
+
+    Write-Host "已更新上傳記錄：$RecordFile" -ForegroundColor DarkGray
 }
 else {
     Write-Host ""
