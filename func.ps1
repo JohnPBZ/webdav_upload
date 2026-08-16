@@ -1,7 +1,11 @@
 function global:up {
     param(
         [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
-        [string[]]$Files
+        [string[]]$Files,
+
+        [Parameter(Mandatory = $false)]
+        [Alias('e')]
+        [switch]$Encryption
     )
     
     $script = "D:\dev\private_upload\Upload-To-WebDAV.ps1"
@@ -22,7 +26,11 @@ function global:up {
         }
 
         Write-Host "`n===== 上傳：$f =====" -ForegroundColor Cyan
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script -FilePath $f -Username $env:WEBDAV_USERNAME
+        $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script, "-FilePath", $f, "-Username", $env:WEBDAV_USERNAME)
+        if ($Encryption) {
+            $args += "-Encryption"
+        }
+        & powershell.exe @args
     }
 
     # 可選：用完後清掉，避免殘留在目前的 PowerShell session

@@ -4,7 +4,11 @@ param(
     [string]$FilePath,
 
     [Parameter(Mandatory = $false)]
-    [string]$Username
+    [string]$Username,
+
+    [Parameter(Mandatory = $false)]
+    [Alias('e')]
+    [switch]$Encryption
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -55,6 +59,59 @@ function Format-FileSize {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
     return "$Bytes bytes"
+}
+
+function Protect-FileWithAes {
+    param(
+        [string]$InputFile,
+        [string]$OutputFile,
+        [string]$Password
+    )
+
+    $salt = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($salt)
+    }
+    finally {
+        $rng.Dispose()
+    }
+
+    $derive = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Password, $salt, 100000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    $key = $derive.GetBytes(32)
+    $derive.Dispose()
+
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Key = $key
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.GenerateIV()
+
+        $encryptor  = $aes.CreateEncryptor()
+        $inStream   = [System.IO.File]::OpenRead($InputFile)
+        $outStream  = [System.IO.File]::Create($OutputFile)
+        try {
+            $outStream.Write($salt, 0, $salt.Length)
+            $outStream.Write($aes.IV, 0, $aes.IV.Length)
+
+            $cryptoStream = New-Object System.Security.Cryptography.CryptoStream($outStream, $encryptor, [System.Security.Cryptography.CryptoStreamMode]::Write)
+            try {
+                $inStream.CopyTo($cryptoStream)
+                $cryptoStream.FlushFinalBlock()
+            }
+            finally {
+                $cryptoStream.Dispose()
+            }
+        }
+        finally {
+            $inStream.Dispose()
+            $outStream.Dispose()
+        }
+    }
+    finally {
+        $aes.Dispose()
+    }
 }
 
 $PathHash = ConvertTo-PathHash -Path $FilePath
@@ -110,6 +167,7 @@ $envContent = Get-Content $EnvFile -Encoding UTF8
 $WebDavPassword  = $null
 $WebDavBaseUrl   = $null
 $WebDavTargetDir = $null
+$EncryptPassword = $null
 
 foreach ($line in $envContent) {
     $line = $line.Trim()
@@ -130,10 +188,18 @@ foreach ($line in $envContent) {
             $WebDavTargetDir += '/'
         }
     }
+    elseif ($line -match '^ENCRYPT_PASSWORD=(.*)$') {
+        $EncryptPassword = $matches[1].Trim()
+    }
 }
 
 if (-not $WebDavPassword -or -not $WebDavBaseUrl -or -not $WebDavTargetDir) {
     Write-Host ".env 檔案缺少必要設定（WEBDAV_PASSWORD / WEBDAV_BASE_URL / WEBDAV_TARGET_DIR）" -ForegroundColor Red
+    exit 1
+}
+
+if ($Encryption -and [string]::IsNullOrEmpty($EncryptPassword)) {
+    Write-Host "使用 -Encryption 需要 .env 設定 ENCRYPT_PASSWORD" -ForegroundColor Red
     exit 1
 }
 
@@ -218,16 +284,42 @@ if (-not $ok) {
 Write-Host ""
 
 # -------------------------------------------------
+# 加密壓縮（-Encryption）：先 zip 再 AES-256 加密
+# -------------------------------------------------
+$UploadFile = $FilePath
+$UploadName = $FileName
+$TempDir    = $null
+
+if ($Encryption) {
+    $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("PrivateUpload_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $TempDir | Out-Null
+    $TempZip = Join-Path $TempDir "$FileName.zip"
+    $TempEnc = Join-Path $TempDir "$FileName.zip.enc"
+
+    Write-Host "正在壓縮：$FileName ..." -ForegroundColor Yellow
+    Compress-Archive -Path $FilePath -DestinationPath $TempZip -CompressionLevel Optimal
+    Write-Host "壓縮完成：$(Split-Path -Leaf $TempZip)（$(Format-FileSize -Bytes (Get-Item $TempZip).Length)）" -ForegroundColor Green
+
+    Write-Host "正在加密（AES-256，密碼來自 .env）..." -ForegroundColor Yellow
+    Protect-FileWithAes -InputFile $TempZip -OutputFile $TempEnc -Password $EncryptPassword
+
+    $UploadFile = $TempEnc
+    $UploadName = Split-Path -Leaf $TempEnc
+    Write-Host "加密完成：$UploadName（$(Format-FileSize -Bytes (Get-Item $TempEnc).Length)）" -ForegroundColor Green
+    Write-Host ""
+}
+
+# -------------------------------------------------
 # 使用 curl 上傳（自帶進度條）
 # -------------------------------------------------
-$TargetUrl = "$WebDavBaseUrl$WebDavTargetDir$([Uri]::EscapeDataString($FileName))"
+$TargetUrl = "$WebDavBaseUrl$WebDavTargetDir$([Uri]::EscapeDataString($UploadName))"
 
 Write-Host "上傳目標：$TargetUrl" -ForegroundColor Gray
 Write-Host "正在上傳..." -ForegroundColor Yellow
 Write-Host ""
 
 $curlArgs = @(
-    "-T", $FilePath,
+    "-T", $UploadFile,
     "-u", $Auth,
     "-o", "NUL",                              # 關鍵：丟棄回應，進度條才會出現
     "-#",                                     # 進度條
@@ -237,36 +329,45 @@ $curlArgs = @(
     $TargetUrl
 )
 
-& curl.exe @curlArgs
+try {
+    & curl.exe @curlArgs
 
-if ($LASTEXITCODE -eq 0) {
-    Write-Host ""
-    Write-Host "上傳成功！" -ForegroundColor Green
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host ""
+        Write-Host "上傳成功！" -ForegroundColor Green
 
-    # 更新上傳記錄（移除舊的相同路徑雜湊或相同 MD5 記錄，再寫入新的一筆）
-    $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $newLine = "$PathHash;$Md5;$FileSize;$now"
+        # 更新上傳記錄（移除舊的相同路徑雜湊或相同 MD5 記錄，再寫入新的一筆）
+        # 注意：記錄存的是「原始檔案」的 MD5/大小，讓改名/移動後仍能比對去重
+        $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $newLine = "$PathHash;$Md5;$FileSize;$now"
 
-    $oldLines = @()
-    if (Test-Path -LiteralPath $RecordFile) {
-        foreach ($line in (Get-Content -LiteralPath $RecordFile -Encoding UTF8)) {
-            $line = $line.Trim()
-            if ($line -eq '') { continue }
-            $fields = $line -split ';'
-            if ($fields.Count -ge 4 -and $fields[0] -ne $PathHash -and $fields[1] -ine $Md5) {
-                $oldLines += $line
+        $oldLines = @()
+        if (Test-Path -LiteralPath $RecordFile) {
+            foreach ($line in (Get-Content -LiteralPath $RecordFile -Encoding UTF8)) {
+                $line = $line.Trim()
+                if ($line -eq '') { continue }
+                $fields = $line -split ';'
+                if ($fields.Count -ge 4 -and $fields[0] -ne $PathHash -and $fields[1] -ine $Md5) {
+                    $oldLines += $line
+                }
             }
         }
-    }
-    $oldLines += $newLine
-    $oldLines | Set-Content -LiteralPath $RecordFile -Encoding UTF8
+        $oldLines += $newLine
+        $oldLines | Set-Content -LiteralPath $RecordFile -Encoding UTF8
 
-    Write-Host "已更新上傳記錄：$RecordFile" -ForegroundColor DarkGray
+        Write-Host "已更新上傳記錄：$RecordFile" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host ""
+        Write-Host "上傳失敗（curl 結束代碼：$LASTEXITCODE）" -ForegroundColor Red
+        exit 1
+    }
 }
-else {
-    Write-Host ""
-    Write-Host "上傳失敗（curl 結束代碼：$LASTEXITCODE）" -ForegroundColor Red
-    exit 1
+finally {
+    if ($TempDir -and (Test-Path -LiteralPath $TempDir)) {
+        Remove-Item -LiteralPath $TempDir -Recurse -Force
+        Write-Host "已刪除暫存檔：$TempDir" -ForegroundColor DarkGray
+    }
 }
 
 Write-Host ""
