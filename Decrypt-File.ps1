@@ -100,6 +100,50 @@ function Unprotect-FileFromAes {
     }
 }
 
+function Expand-ZipHere {
+    param(
+        [string]$ZipFile,
+        [string]$Destination
+    )
+
+    try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipFile)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $relPath = $entry.FullName -replace '\\', '/'
+            $parts = $relPath -split '/', 2
+            if ($parts.Count -eq 2) {
+                $relPath = $parts[1]
+            }
+            if ([string]::IsNullOrWhiteSpace($relPath)) { continue }
+
+            $target = Join-Path $Destination $relPath
+            $dir = Split-Path -Parent $target
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+
+            $inStream = $entry.Open()
+            try {
+                $outStream = [System.IO.File]::Create($target)
+                try {
+                    $inStream.CopyTo($outStream)
+                }
+                finally {
+                    $outStream.Dispose()
+                }
+            }
+            finally {
+                $inStream.Dispose()
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
+
 $OutputFile = Join-Path (Split-Path -Parent $FilePath) ($FileName -replace '\.enc$', '.zip')
 
 Write-Host "正在解密：$FileName ..." -ForegroundColor Yellow
@@ -107,7 +151,6 @@ try {
     Unprotect-FileFromAes -InputFile $FilePath -OutputFile $OutputFile -Password $EncryptPassword
     Write-Host ""
     Write-Host "解密成功：$OutputFile" -ForegroundColor Green
-    Write-Host "這是 zip 檔，可用 Windows 內建解壓縮開啟（或 Expand-Archive 解壓）" -ForegroundColor Gray
 }
 catch {
     if (Test-Path -LiteralPath $OutputFile) {
@@ -116,5 +159,16 @@ catch {
     Write-Host ""
     Write-Host "解密失敗：密碼錯誤或檔案損壞。" -ForegroundColor Red
     Write-Host "原始錯誤：$($_.Exception.Message)" -ForegroundColor DarkGray
+    exit 1
+}
+
+Write-Host "正在解壓縮（解壓縮至此，不含最外層資料夾）..." -ForegroundColor Yellow
+try {
+    Expand-ZipHere -ZipFile $OutputFile -Destination (Split-Path -Parent $OutputFile)
+    Write-Host "解壓完成：$(Split-Path -Parent $OutputFile)" -ForegroundColor Green
+    Write-Host "zip 暫存檔保留在：$OutputFile（確認內容無誤後可自行刪除）" -ForegroundColor DarkGray
+}
+catch {
+    Write-Host "解壓縮失敗：$($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
