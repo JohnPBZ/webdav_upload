@@ -112,6 +112,7 @@ function Expand-ZipHere {
     try {
         foreach ($entry in $zip.Entries) {
             $relPath = $entry.FullName -replace '\\', '/'
+            if ($relPath.EndsWith('/')) { continue }
             $parts = $relPath -split '/', 2
             if ($parts.Count -eq 2) {
                 $relPath = $parts[1]
@@ -166,9 +167,12 @@ Write-Host "正在解壓縮（解壓縮至此，不含最外層資料夾）..." 
 try {
     Expand-ZipHere -ZipFile $OutputFile -Destination (Split-Path -Parent $OutputFile)
     Write-Host "解壓完成：$(Split-Path -Parent $OutputFile)" -ForegroundColor Green
-    Write-Host "zip 暫存檔保留在：$OutputFile（確認內容無誤後可自行刪除）" -ForegroundColor DarkGray
+    Remove-Item -LiteralPath $OutputFile -Force
+    Remove-Item -LiteralPath $FilePath -Force
+    Write-Host "已刪除暫存檔案：$FileName、$(Split-Path -Leaf $OutputFile)" -ForegroundColor DarkGray
 }
 catch {
     Write-Host "解壓縮失敗：$($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "原始檔案已保留（.enc / .zip 未刪除）" -ForegroundColor DarkGray
     exit 1
 }
