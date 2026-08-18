@@ -8,7 +8,13 @@ param(
 
     [Parameter(Mandatory = $false)]
     [Alias('e')]
-    [switch]$Encryption
+    [switch]$Encryption,
+
+    # -d / -Diff：差異上傳模式（僅資料夾）。比對本地 fingerprint.json，
+    # 將所有變動檔案打包成單一「資料夾名_yyyyMMdd_HHmmss.diff」，可選 AES 加密成 .diff.enc 上傳。
+    [Parameter(Mandatory = $false)]
+    [Alias('d')]
+    [switch]$Diff
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -16,6 +22,13 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnvFile   = Join-Path $ScriptDir ".env"
+$CoreFile  = Join-Path $ScriptDir "fingerprint-core.ps1"
+
+if (-not (Test-Path -LiteralPath $CoreFile)) {
+    Write-Host "找不到核心函式檔：$CoreFile" -ForegroundColor Red
+    exit 1
+}
+. $CoreFile
 
 # 檢查拖入的檔案
 if (-not $FilePath) {
@@ -144,7 +157,14 @@ else {
     $Md5 = (Get-FileHash -LiteralPath $FilePath -Algorithm MD5).Hash.ToLower()
 }
 
-if ($IsFolder -and -not $Encryption) {
+# -d 模式僅支援資料夾：需先以 -e 上傳過以建立 fingerprint.json
+if ($Diff -and -not $IsFolder) {
+    Write-Host "-Diff 模式僅支援資料夾（需先以 -Encryption 上傳過以建立 fingerprint.json）" -ForegroundColor Red
+    exit 1
+}
+
+# 資料夾必須 -e（全量加密）或 -d（差異）才能上傳
+if ($IsFolder -and -not $Encryption -and -not $Diff) {
     Write-Host "資料夾上傳需要先加密壓縮：請改用 -Encryption（或 Upload-To-WebDAV-Enc.bat）" -ForegroundColor Red
     exit 1
 }
@@ -174,7 +194,7 @@ else {
     }
 }
 
-if ($existing) {
+if ($existing -and -not $Diff) {
     Write-Host "此檔案先前已上傳過：" -ForegroundColor Yellow
     Write-Host "  上次上傳日期：$($existing[2])" -ForegroundColor Yellow
     Write-Host "  MD5：$($existing[0])" -ForegroundColor Yellow
@@ -304,6 +324,146 @@ function Ensure-WebDavDirectory {
     return $true
 }
 
+# =================================================
+# -d 差異上傳分支：所有變動檔案打成單一差異包後上傳
+# =================================================
+if ($Diff) {
+    $rootHash = ConvertTo-PathHash -Path (Get-NormalizedPath -Path $FilePath)
+    $fpInfo = Read-Fingerprint -Root $FilePath -Directory $ScriptDir
+    if (-not $fpInfo) {
+        Write-Host "找不到此資料夾的 fingerprint 紀錄（fingerprint-$($rootHash.Substring(0, 8))....json），請先以 -Encryption 上傳此資料夾。" -ForegroundColor Red
+        exit 1
+    }
+
+    $fp     = $fpInfo.Json
+    $FpPath = $fpInfo.FilePath
+
+    $oldFiles = @{}
+    foreach ($rec in $fp.files) {
+        $oldFiles[$rec.rel_hash] = @([string]$rec.sha256, [long]$rec.size, [long]$rec.mtime)
+    }
+
+    Write-Host "正在比對本地紀錄與目前檔案..." -ForegroundColor Cyan
+    $delta = Get-FolderDelta -Path $FilePath -OldFiles $oldFiles
+
+    if ($delta.Changed.Count -eq 0) {
+        Write-Host "沒有變動的檔案，無需上傳。" -ForegroundColor Green
+        exit 0
+    }
+
+    Write-Host "偵測到 $($delta.Changed.Count) 個變動檔案：" -ForegroundColor Yellow
+    foreach ($f in $delta.Changed) {
+        Write-Host "  $($f.RelNorm)（$($f.Reason)）" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    # 確保目標目錄已存在（差異包上傳至目標根）
+    Write-Host "正在檢查目標目錄..." -ForegroundColor Cyan
+    $ok = Ensure-WebDavDirectory -BaseUrl $WebDavBaseUrl -TargetDir $WebDavTargetDir -AuthString $Auth
+    if (-not $ok) {
+        Write-Host "無法建立目標目錄，上傳中止。" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ""
+
+    # 新紀錄以目前檔案狀態為基礎（已刪除的檔案自然消失）
+    $newRecords = @{}
+    foreach ($nf in $delta.NewFiles) {
+        $newRecords[$nf.RelHash] = @($nf.Sha256, $nf.Size, $nf.Mtime)
+    }
+
+    # 差異包暫存目錄：複製所有變動檔案至此（保留相對結構），打包成單一壓縮檔上傳
+    $DiffTempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("PrivateUpload_diff_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $DiffTempDir | Out-Null
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $uploadName = "$($FileName)_$timestamp.diff"
+    $zipPath    = Join-Path $env:TEMP ("PrivateUpload_diffpack_" + [guid]::NewGuid().ToString('N') + '.zip')
+    $uploadSource = $zipPath
+    $payloadNote  = ''
+
+    try {
+        # 1. 複製變動檔案到暫存目錄（保持相對路徑結構）
+        foreach ($f in $delta.Changed) {
+            $dest = Join-Path $DiffTempDir ($f.RelNorm -replace '/', '\')
+            New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+            Copy-Item -LiteralPath $f.FullPath -Destination $dest
+        }
+
+        # 2. 打包為單一 zip（zip 放在暫存目錄外層，避免自體鎖定）
+        Write-Host "正在打包 $($delta.Changed.Count) 個變動檔案..." -ForegroundColor Yellow
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($DiffTempDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        Write-Host "打包完成：$(Split-Path -Leaf $zipPath)（$(Format-FileSize -Bytes (Get-Item $zipPath).Length)）" -ForegroundColor Green
+
+        # 3. 加密（-e 模式：AES-256，密碼來自 .env）
+        if ($Encryption) {
+            $tempEnc = Join-Path $DiffTempDir ($uploadName + '.enc')
+            Write-Host "正在加密差異包（AES-256，密碼來自 .env）..." -ForegroundColor Yellow
+            Protect-FileWithAes -InputFile $zipPath -OutputFile $tempEnc -Password $EncryptPassword
+            $uploadSource = $tempEnc
+            $uploadName  += '.enc'
+            $payloadNote  = '（zip+AES）'
+            Write-Host "加密完成：$uploadName（$(Format-FileSize -Bytes (Get-Item $tempEnc).Length)）" -ForegroundColor Green
+        }
+
+        # 4. 上傳差異包至目標目錄根
+        $targetUrl = "$WebDavBaseUrl$WebDavTargetDir$([Uri]::EscapeDataString($uploadName))"
+        Write-Host "上傳變動包：$uploadName$payloadNote" -ForegroundColor Cyan
+        Write-Host "  目標：$targetUrl" -ForegroundColor Gray
+
+        $curlArgs = @(
+            "-T", $uploadSource,
+            "-u", $Auth,
+            "-o", "NUL",
+            "-#",
+            "-f",
+            "-S",
+            "-H", "Content-Type: application/octet-stream",
+            $targetUrl
+        )
+
+        & curl.exe @curlArgs
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host ""
+            Write-Host "  → 差異包上傳成功" -ForegroundColor Green
+        }
+        else {
+            Write-Host ""
+            Write-Host "  → 差異包上傳失敗（curl 結束代碼：$LASTEXITCODE），fingerprint 未更新" -ForegroundColor Red
+            exit 1
+        }
+    }
+    catch {
+        Write-Host "差異包建立失敗：$($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    finally {
+        if (Test-Path -LiteralPath $DiffTempDir) {
+            Remove-Item -LiteralPath $DiffTempDir -Recurse -Force
+        }
+        if ($zipPath -and (Test-Path -LiteralPath $zipPath)) {
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+        if ($uploadSource -and $uploadSource -ne $zipPath -and (Test-Path -LiteralPath $uploadSource)) {
+            Remove-Item -LiteralPath $uploadSource -Force
+        }
+        Write-Host "已刪除暫存檔" -ForegroundColor DarkGray
+    }
+
+    $createdAt = if ($fp.created_at) { $fp.created_at } else { (Get-Date).ToString('o') }
+    $newFp = ConvertTo-FingerprintJson -Root $FilePath -Files $newRecords -CreatedAt $createdAt
+    $newFp | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $FpPath -Encoding UTF8
+
+    Write-Host ""
+    Write-Host "已更新 fingerprint.json：$FpPath" -ForegroundColor DarkGray
+    Write-Host "完成。差異上傳結束。" -ForegroundColor Cyan
+    exit 0
+}
+
+# -------------------------------------------------
+# 一般上傳（單檔或 -Encryption 資料夾）
+# -------------------------------------------------
 Write-Host "正在檢查並建立目標目錄..." -ForegroundColor Cyan
 $ok = Ensure-WebDavDirectory -BaseUrl $WebDavBaseUrl -TargetDir $WebDavTargetDir -AuthString $Auth
 
@@ -368,7 +528,6 @@ try {
         Write-Host "上傳成功！" -ForegroundColor Green
 
         # 更新上傳記錄（移除舊的相同路徑雜湊或相同 MD5 記錄，再寫入新的一筆）
-        # 注意：記錄存的是「原始檔案」的 MD5/大小，讓改名/移動後仍能比對去重
         $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $newLine = "$PathHash;$Md5;$FileSize;$now"
 
@@ -387,6 +546,27 @@ try {
         $oldLines | Set-Content -LiteralPath $RecordFile -Encoding UTF8
 
         Write-Host "已更新上傳記錄：$RecordFile" -ForegroundColor DarkGray
+
+        # -Encryption 資料夾上傳成功後，建立 fingerprint.json（紀錄所有子檔案）
+        if ($IsFolder -and $Encryption) {
+            Write-Host "正在建立 fingerprint.json（紀錄所有子檔案）..." -ForegroundColor Yellow
+            $allFiles = @{}
+            $rootNorm = $FilePath.TrimEnd('\')
+            foreach ($fl in (Get-ChildItem -LiteralPath $FilePath -Recurse -File -ErrorAction SilentlyContinue)) {
+                $rel     = $fl.FullName.Substring($rootNorm.Length).TrimStart('\')
+                $relNorm = $rel.Replace('\', '/').ToLowerInvariant()
+                $relHash = ConvertTo-PathHash -Path $relNorm
+                $allFiles[$relHash] = @(
+                    (Get-FileHash -LiteralPath $fl.FullName -Algorithm SHA256).Hash.ToLower(),
+                    [long]$fl.Length,
+                    [long]$fl.LastWriteTimeUtc.Ticks
+                )
+            }
+            $fpObj = ConvertTo-FingerprintJson -Root $FilePath -Files $allFiles
+            $fpPath = Get-FingerprintFilePath -Root $FilePath -Directory $ScriptDir
+            $fpObj | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $fpPath -Encoding UTF8
+            Write-Host "已建立 fingerprint.json：$fpPath（$($allFiles.Count) 個檔案）" -ForegroundColor Green
+        }
     }
     else {
         Write-Host ""

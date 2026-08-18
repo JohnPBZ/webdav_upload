@@ -10,7 +10,7 @@ function global:up {
         Remove-Item -Path Function:\global:up -ErrorAction SilentlyContinue
         
         # 載入真正的實作（請確保 func.ps1 裡面用 function global:up）
-        . "D:\dev\private_upload\func.ps1"
+        . "C:\Users\Junan\Documents\John\Tools\webdav_upload\func.ps1"
     }
 
     # 現在呼叫的一定是真正的 up

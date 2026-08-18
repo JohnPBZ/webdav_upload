@@ -1,14 +1,18 @@
-function global:up {
+﻿function global:up {
     param(
         [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
         [string[]]$Files,
 
         [Parameter(Mandatory = $false)]
         [Alias('e')]
-        [switch]$Encryption
+        [switch]$Encryption,
+
+        [Parameter(Mandatory = $false)]
+        [Alias('d')]
+        [switch]$Diff
     )
     
-    $script = "D:\dev\private_upload\Upload-To-WebDAV.ps1"
+    $script = "C:\Users\Junan\Documents\John\Tools\webdav_upload\Upload-To-WebDAV.ps1"
 
     # 只詢問一次，並設成環境變數（子程序會繼承）
     if ([string]::IsNullOrWhiteSpace($env:WEBDAV_USERNAME)) {
@@ -29,6 +33,9 @@ function global:up {
         $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script, "-FilePath", $f, "-Username", $env:WEBDAV_USERNAME)
         if ($Encryption) {
             $args += "-Encryption"
+        }
+        if ($Diff) {
+            $args += "-Diff"
         }
         & powershell.exe @args
     }

@@ -1,3 +1,5 @@
 .env
 .agents/skills/
 upload-record.txt
+fingerprint*.json
+.crush
